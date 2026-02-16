@@ -43,6 +43,7 @@ import warnings
 import time
 from interpolator_amr import AMRInterpolator, supported_amr_interpolators
 from operator import itemgetter
+from serializers import parse_herm_spectrum_sequence
 
 
 interp_method_aliases = {"trilinear":"linear"}
@@ -3395,6 +3396,7 @@ class VlsvReader(object):
        2 => "ZFP",
        3 => "OCTREE",
        _ => "None",
+       5 => "HERMITE",
       '''
       try:
          compression=self.read_parameter("COMPRESSION")
@@ -3445,6 +3447,61 @@ class VlsvReader(object):
            "bbox_lims": bbox_lims,
            "read_index": offset,
        }
+
+   import struct
+   import numpy as np
+   
+   def parse_herm_spectrum_bytes(buf: bytes, size_t_fmt='Q', real_fmt='d'):
+         offset = 0
+         le = '<'
+         buf_len = len(buf)
+         def need(n):
+            if offset + n > buf_len:
+               raise ValueError("overflow")
+         # N_hermite_harmonic (int32)
+         need(4)
+         N_hermite_harmonic = struct.unpack_from(le + 'i', buf, offset)[0]; offset += 4
+         # vth (float32)
+         need(4)
+         vth = struct.unpack_from(le + 'f', buf, offset)[0]; offset += 4
+         # u (3 floats)
+         need(12)
+         u = np.array(struct.unpack_from(le + '3f', buf, offset), dtype=np.float32); offset += 12
+         # size_t vector length
+         size_fmt = le + size_t_fmt
+         size_sz = struct.calcsize(size_fmt)
+         need(size_sz)
+         (vec_size,) = struct.unpack_from(size_fmt, buf, offset); offset += size_sz
+         # HermSpectrum floats
+         herm_bytes = 4 * int(vec_size)
+         need(herm_bytes)
+         herm_spectrum = np.frombuffer(buf, dtype=np.float32, count=int(vec_size), offset=offset).copy(); offset += herm_bytes
+         # v_limits: 6 * Real
+         real_fmt_full = le + (real_fmt * 6)
+         real_sz = struct.calcsize(real_fmt_full)
+         need(real_sz)
+         v_limits = np.array(struct.unpack_from(real_fmt_full, buf, offset)); offset += real_sz
+         # shape: 3 * size_t
+         shape_fmt = le + (size_t_fmt * 3)
+         shape_sz = struct.calcsize(shape_fmt)
+         need(shape_sz)
+         shape = struct.unpack_from(shape_fmt, buf, offset); offset += shape_sz
+         # optional reshape
+         try:
+            prod = int(np.prod(shape))
+            if prod == int(vec_size):
+               herm_spectrum = herm_spectrum.reshape(tuple(int(s) for s in shape))
+         except Exception:
+            pass
+         return {
+            "N_hermite_harmonic": int(N_hermite_harmonic),
+            "vth": float(vth),
+            "u": u,
+            "HermSpectrum": herm_spectrum,
+            "v_limits": v_limits,
+            "shape": tuple(int(s) for s in shape),
+            "bytes_read": offset,
+         }   
 
 
    def read_velocity_cells(self, cellid, pop="proton"):
@@ -3625,6 +3682,19 @@ class VlsvReader(object):
                             global_id = local_id + WID3 * velocity_block_id
                             velocity_cells[int(global_id)] = float(val)
                 return velocity_cells # we rrturn early here since we have already constructed the velocity_cells thingy 
+
+            elif compression_type == 5:  # HERMITE
+               # Read a bytes blob for this cell and attempt to parse successive HermSpectrum structs
+               bpc = self.read(mesh="SpatialGrid", tag="BYTESPERCELL", name=pop)
+               amount = bpc[cells_with_blocks_index]
+               loc = ast.literal_eval(child.text) + np.sum(bpc[0:cells_with_blocks_index])
+               fptr.seek(loc)
+               blob = fptr.read(int(amount))
+               # Try parsing sequence; assume size_t=8 and Real=double by default
+               parsed_list, consumed = parse_herm_spectrum_sequence(blob, size_t_fmt='Q', real_fmt='d')
+               # Return parsed list keyed by incremental index
+               velocity_cells = {i: p for i, p in enumerate(parsed_list)}
+               return velocity_cells
 
             elif compression_type == 4: # No asterix compression used here 
                 vector_size = ast.literal_eval(child.attrib["vectorsize"])
